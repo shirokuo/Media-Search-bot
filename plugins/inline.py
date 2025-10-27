@@ -2,10 +2,11 @@
 
 import logging
 import asyncio
+import uuid
 from urllib.parse import quote
 
 from pyrogram import Client, emoji, filters
-from pyrogram.errors import UserNotParticipant
+from pyrogram.errors import UserNotParticipant, BadRequest
 from pyrogram.types import (
     InlineQueryResultCachedDocument,
     InlineQueryResultArticle,
@@ -21,13 +22,52 @@ logger = logging.getLogger(__name__)
 cache_time = 0 if AUTH_USERS or AUTH_CHANNEL else CACHE_TIME
 
 
+def _make_id(prefix: str = "r"):
+    """Generate short unique id for inline results"""
+    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+
+def _make_reply_markup(file_name: str):
+    # tombol share yang sederhana; gunakan switch_inline_query_current_chat jika mau cari dari nama file
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔎 Cari lagi", switch_inline_query_current_chat=file_name)],
+            [InlineKeyboardButton("📤 Bagikan bot", url=f"t.me/share/url?url={SHARE_BUTTON_TEXT}")],
+        ]
+    )
+
+
+def size_formatter(size):
+    if not size:
+        return "N/A"
+    try:
+        size = int(size)
+    except Exception:
+        return "N/A"
+    if size < 1024:
+        return f"{size} B"
+    elif size < 1024 ** 2:
+        return f"{size / 1024:.2f} KB"
+    elif size < 1024 ** 3:
+        return f"{size / 1024 ** 2:.2f} MB"
+    else:
+        return f"{size / 1024 ** 3:.2f} GB"
+
+
 @Client.on_inline_query(filters.user(AUTH_USERS) if AUTH_USERS else None)
 async def answer(bot, query):
+    """
+    Inline query handler with robust error handling:
+    - catches MESSAGE_NOT_MODIFIED and other BadRequest errors from Telegram
+    - provides unique ids for inline results
+    - returns a 'not found' article when no results
+    """
     try:
         text = (query.query or "").strip()
         offset = int(query.offset or 0)
         is_empty = text == ""
 
+        # call get_search_results with sensible timeout
         try:
             files, next_offset = await asyncio.wait_for(
                 get_search_results(text, max_results=10, offset=offset, recent=is_empty),
@@ -35,102 +75,99 @@ async def answer(bot, query):
             )
         except asyncio.TimeoutError:
             logger.warning(f"Search timeout for query: {text}")
-            await query.answer(
-                results=[
-                    InlineQueryResultArticle(
-                        title="⚠️ Pencarian terlalu lama",
-                        input_message_content=InputTextMessageContent(
-                            "⏳ Pencarian melebihi batas waktu. Coba gunakan kata kunci yang lebih spesifik."
-                        ),
-                        description="Coba perpendek atau perjelas kata kunci kamu.",
-                    )
-                ],
-                cache_time=0,
-                switch_pm_text="⚠️ Timeout",
-                switch_pm_parameter="timeout"
+            # Kirim hasil timeout sebagai inline article (unik id)
+            timeout_result = InlineQueryResultArticle(
+                id=_make_id("timeout"),
+                title="⚠️ Pencarian terlalu lama",
+                input_message_content=InputTextMessageContent(
+                    "⏳ Pencarian melebihi batas waktu. Coba gunakan kata kunci yang lebih spesifik."
+                ),
+                description="Coba perpendek atau perjelas kata kunci kamu.",
             )
+            try:
+                await query.answer(results=[timeout_result], cache_time=0, is_personal=True)
+            except BadRequest as be:
+                # Tangani MESSAGE_NOT_MODIFIED dan lainnya
+                msg = str(be)
+                if "MESSAGE_NOT_MODIFIED" in msg:
+                    logger.debug("Ignored MESSAGE_NOT_MODIFIED while sending timeout_result")
+                else:
+                    logger.exception("BadRequest while answering timeout result: %s", be)
+            except Exception:
+                logger.exception("Unexpected error while answering timeout result")
             return
 
         results = []
         if files:
             for f in files:
+                # file bisa berupa dict (dari normalize) — aman untuk akses dengan .get
                 file_id = f.get("file_id")
                 file_name = f.get("file_name") or "Tanpa Nama"
                 file_size = f.get("file_size") or 0
                 file_type = f.get("file_type") or "Unknown"
                 caption = f.get("caption") or ""
 
-                results.append(
-                    InlineQueryResultCachedDocument(
-                        title=file_name,
-                        document_file_id=file_id,
-                        caption=caption,
-                        description=f"📦 {file_type.upper()} | 💾 {round(file_size/1024/1024, 2)} MB",
-                        reply_markup=InlineKeyboardMarkup(
-                            [
-                                [InlineKeyboardButton(SHARE_BUTTON_TEXT, switch_inline_query=file_name)]
-                            ]
+                # setiap result beri id unik agar Telegram tidak mengira duplikat dan mencoba edit
+                try:
+                    results.append(
+                        InlineQueryResultCachedDocument(
+                            id=_make_id("doc"),
+                            title=file_name,
+                            document_file_id=file_id,
+                            caption=caption,
+                            description=f"📦 {file_type.upper()} | 💾 {size_formatter(file_size)}",
+                            reply_markup=_make_reply_markup(file_name),
                         )
                     )
-                )
+                except Exception:
+                    # jika ada file_id yang invalid atau error pembuatan result, skip
+                    logger.debug("Skipping invalid file for inline result: %s", file_name, exc_info=True)
+                    continue
 
-        # Jika tidak ada hasil sama sekali, tampilkan not found message langsung di inline result
+        # Tidak ada hasil: kembalikan satu artikel 'not found' (sebagai inline result)
         if not results:
-            results.append(
-                InlineQueryResultArticle(
-                    title=f"{emoji.CROSS_MARK} Tidak ditemukan hasil",
-                    input_message_content=InputTextMessageContent(
-                        f"❌ Tidak ditemukan file yang cocok untuk: **{text or 'Kueri kosong'}**"
-                    ),
-                    description="Coba kata kunci lain atau periksa ejaan file.",
-                )
+            nf_title = f"{emoji.CROSS_MARK} Tidak ditemukan hasil"
+            nf_text = f"❌ Tidak ditemukan file yang cocok untuk: **{text or 'Kueri kosong'}**\nCoba kata kunci lain."
+            not_found = InlineQueryResultArticle(
+                id=_make_id("nf"),
+                title=nf_title,
+                input_message_content=InputTextMessageContent(nf_text),
+                description="Coba kata kunci lain atau periksa ejaan.",
             )
+            results = [not_found]
 
-        await query.answer(
-            results=results,
-            cache_time=cache_time,
-            is_personal=True,
-            next_offset=str(next_offset) if next_offset else "",
-        )
-
-    except Exception as e:
-        logger.exception(f"❌ Inline query error: {e}")
+        # Jawab ke Telegram — bungkus dengan try/except untuk tangani MESSAGE_NOT_MODIFIED
         try:
             await query.answer(
-                results=[
-                    InlineQueryResultArticle(
-                        title="❌ Terjadi kesalahan",
-                        input_message_content=InputTextMessageContent("⚠️ Kesalahan internal, coba lagi nanti."),
-                    )
-                ],
-                cache_time=0,
+                results=results,
+                cache_time=cache_time,
                 is_personal=True,
+                next_offset=str(next_offset) if next_offset else "",
             )
+        except BadRequest as be:
+            # Tangani kasus di mana Telegram menolak karena "message not modified"
+            msg = str(be)
+            if "MESSAGE_NOT_MODIFIED" in msg:
+                # Terjadi saat bot mencoba mengirim/mengedit dengan konten yang sama — aman diabaikan
+                logger.debug("Ignored MESSAGE_NOT_MODIFIED while answering inline query for '%s'", text)
+            else:
+                # Log exception lengkap untuk investigasi
+                logger.exception("BadRequest when answering inline query: %s", be)
+        except Exception as e:
+            logger.exception("Unexpected error when answering inline query: %s", e)
+
+    except Exception as e:
+        logger.exception("❌ Inline query handler failed unexpectedly: %s", e)
+        # fallback safe response
+        try:
+            fallback = InlineQueryResultArticle(
+                id=_make_id("err"),
+                title="❌ Terjadi kesalahan",
+                input_message_content=InputTextMessageContent("⚠️ Kesalahan internal, coba lagi nanti."),
+            )
+            await query.answer(results=[fallback], cache_time=0, is_personal=True)
         except Exception:
-            pass
-
-
-def get_reply_markup(username, query):
-    url = 't.me/share/url?url=' + quote(SHARE_BUTTON_TEXT.format(username=username))
-    buttons = [
-        [
-            InlineKeyboardButton("🔎 Cari lagi", switch_inline_query_current_chat=query),
-            InlineKeyboardButton("📤 Bagikan bot", url=url),
-        ]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-def size_formatter(size):
-    """Get size in readable format"""
-
-    units = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB"]
-    size = float(size)
-    i = 0
-    while size >= 1024.0 and i < len(units):
-        i += 1
-        size /= 1024.0
-    return "%.2f %s" % (size, units[i])
+            logger.exception("Also failed to send fallback inline message")
 
 
 async def is_subscribed(bot, query):
