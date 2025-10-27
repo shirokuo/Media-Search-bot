@@ -60,93 +60,126 @@ async def save_file(media):
 
 async def get_search_results(query: str, file_type=None, max_results=10, offset=0, recent=False):
     """
-    Advanced search with:
-    - Smart regex that tolerates partial match, punctuation, and spacing
-    - Optional caption search
-    - Fallback fuzzy search in Python
-    - Returns (results, next_offset)
+    Adaptive, batch-based search:
+    - If recent or empty -> return recent files fast.
+    - If query length >= 3 -> try server-side regex but iterate cursor in batches and stop early.
+    - If server-side fails or query short -> fallback to client-side batch scan (small batches) until enough results.
+    Returns (normalized_list, next_offset)
     """
-
     q = (query or "").strip()
-    projection = {
-        "file_name": 1,
-        "file_size": 1,
-        "file_type": 1,
-        "caption": 1,
-        "file_id": 1,
-    }
+    projection = {"file_name": 1, "file_size": 1, "file_type": 1, "caption": 1, "_id": 1}
+    col = database[COLLECTION_NAME]
 
     def _normalize(docs):
-        normalized = []
+        out = []
         for d in docs:
-            normalized.append({
-                "file_id": d.get("file_id") or str(d.get("_id")),
+            out.append({
+                "file_id": str(d.get("_id")),
                 "file_name": d.get("file_name"),
                 "file_size": d.get("file_size"),
                 "file_type": d.get("file_type"),
                 "caption": d.get("caption"),
             })
-        return normalized
+        return out
 
-    # Jika query kosong atau recent=True, ambil file terbaru
+    # 1) recent / empty query -> recent results fast
     if recent or not q:
-        cursor = database[COLLECTION_NAME].find({}, projection).sort("$natural", -1).skip(offset).limit(max_results)
+        cursor = col.find({}, projection).sort("$natural", -1).skip(offset).limit(max_results)
         docs = await cursor.to_list(length=max_results)
         normalized = _normalize(docs)
         next_offset = "" if len(normalized) < max_results else offset + max_results
         return normalized, next_offset
 
-    # 🔍 Regex super fleksibel
-    # Contoh input: "how bot" → hasilkan pola "how.*bot"
+    # prepare smart regex pattern (super flexible)
     safe_query = re.sub(r"[^0-9a-zA-Z\u00C0-\u024F]+", " ", q).strip()
-    regex_pattern = ".*".join(map(re.escape, safe_query.split()))
-    smart_regex = re.compile(regex_pattern, re.IGNORECASE)
+    pattern_parts = [re.escape(p) for p in safe_query.split() if p]
+    if not pattern_parts:
+        # fallback to substring
+        pattern = re.escape(q)
+    else:
+        pattern = ".*".join(pattern_parts)
+    smart_regex = re.compile(pattern, re.IGNORECASE)
 
-    # 🔹 Tahap 1: Regex search di Mongo (dengan batas waktu aman)
+    # if file_type filter provided, include it
+    file_type_filter = {"file_type": file_type} if file_type else {}
+
+    # 2) Try server-side regex but iterate in batches and stop early
     try:
-        mongo_filter = {
-            "$or": [{"file_name": {"$regex": smart_regex}}]
-        }
+        # If query is short (len < 3) server might scan too much — we will still try but with cautious batch size
+        batch_size = 50 if len(q) >= 3 else 30
+
+        mongo_filter = {"file_name": {"$regex": smart_regex}}
         if USE_CAPTION_FILTER:
-            mongo_filter["$or"].append({"caption": {"$regex": smart_regex}})
+            mongo_filter = {"$or": [{"file_name": {"$regex": smart_regex}}, {"caption": {"$regex": smart_regex}}]}
 
-        cursor = (
-            database[COLLECTION_NAME]
-            .find(mongo_filter, projection)
-            .sort("$natural", -1)
-            .skip(offset)
-            .limit(max_results)
-            .max_time_ms(2500)
-        )
-        docs = await cursor.to_list(length=max_results)
-        if docs:
-            normalized = _normalize(docs)
-            next_offset = "" if len(normalized) < max_results else offset + max_results
-            logger.info(f"Super regex matched {len(normalized)} result(s) for '{q}'")
+        if file_type:
+            # add file_type constraint
+            if "$or" in mongo_filter:
+                for clause in mongo_filter["$or"]:
+                    clause.update({"file_type": file_type})
+            else:
+                mongo_filter["file_type"] = file_type
+
+        cursor = col.find(mongo_filter, projection).sort("$natural", -1).batch_size(batch_size)
+        collected = []
+        collected_needed = offset + max_results
+
+        # iterate cursor and stop when enough matches collected
+        while await cursor.fetch_next:
+            doc = cursor.next_object()
+            collected.append(doc)
+            if len(collected) >= collected_needed:
+                break
+
+        # If collected less than needed, we still return what we have
+        sliced = collected[offset: offset + max_results]
+        if sliced:
+            normalized = _normalize(sliced)
+            next_offset = "" if len(sliced) < max_results else offset + max_results
+            logger.info(f"Server-regex matched {len(normalized)} for '{q}' (iterative)")
             return normalized, next_offset
+        # else fallthrough to client-side fallback
     except Exception as e:
-        logger.warning(f"Regex search error for '{q}': {e}")
+        logger.warning(f"Server-side regex failed/slow for '{q}': {e}")
 
-    # 🔹 Tahap 2: fallback fuzzy search (scan sebagian data dan cocokan manual)
+    # 3) Client-side fallback scan in small batches (safe)
     try:
-        recent_docs = await database[COLLECTION_NAME].find({}, projection).sort("$natural", -1).to_list(length=1000)
-        q_lower = q.lower()
+        # For short queries, scan fewer docs per batch to keep fast; longer queries can scan more
+        batch_doc_limit = 200 if len(q) >= 5 else 120
+        scanned = 0
         matched = []
-        for d in recent_docs:
-            name = (d.get("file_name") or "").lower()
-            caption = (d.get("caption") or "").lower()
-            if q_lower in name or (USE_CAPTION_FILTER and q_lower in caption):
-                matched.append(d)
-                if len(matched) >= (offset + max_results):
-                    break
+        # We'll fetch in pages of page_size (to avoid loading huge lists)
+        page_size = 200
+        page = 0
+        q_lower = q.lower()
+
+        while len(matched) < (offset + max_results):
+            docs = await col.find({}, projection).sort("$natural", -1).skip(page * page_size).limit(page_size).to_list(length=page_size)
+            if not docs:
+                break
+            for d in docs:
+                name = (d.get("file_name") or "").lower()
+                caption = (d.get("caption") or "").lower()
+                # match using smart_regex first (fast in Python) or substring
+                if smart_regex.search(name) or (USE_CAPTION_FILTER and smart_regex.search(caption)) or (q_lower in name) or (USE_CAPTION_FILTER and q_lower in caption):
+                    matched.append(d)
+                    if len(matched) >= (offset + max_results):
+                        break
+            scanned += len(docs)
+            page += 1
+            # safety: don't scan indefinitely - cap scanned docs
+            if scanned >= (batch_doc_limit * 5):  # hard cap ~ batch_doc_limit*5 docs
+                break
+
         sliced = matched[offset: offset + max_results]
         if sliced:
             normalized = _normalize(sliced)
             next_offset = "" if len(sliced) < max_results else offset + max_results
-            logger.info(f"Fallback fuzzy matched {len(normalized)} for '{q}'")
+            logger.info(f"Client-fallback matched {len(normalized)} for '{q}' after scanning {scanned} docs")
             return normalized, next_offset
-    except Exception as e:
-        logger.error(f"Fuzzy fallback failed for '{q}': {e}")
 
-    # Jika tidak ada hasil sama sekali
+    except Exception as e:
+        logger.error(f"Client-side fallback error for '{q}': {e}")
+
+    # 4) nothing found
     return [], ""
