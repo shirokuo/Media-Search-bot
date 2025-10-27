@@ -67,33 +67,54 @@ async def get_search_results(query, file_type=None, max_results=10, offset=0, re
     if recent or not query:
         filter_doc = {}
     else:
+        # Gunakan pencarian substring case-insensitive, bukan regex berat
         q = query.strip()
-        # Escape user input to prevent regex issues
-        escaped = re.escape(q)
-        regex = re.compile(f".*{escaped}.*", flags=re.IGNORECASE)
+        filter_doc = {"file_name": {"$regex": q, "$options": "i"}}
+
         if USE_CAPTION_FILTER:
-            filter_doc = {'$or': [{'file_name': regex}, {'caption': regex}]}
-        else:
-            filter_doc = {'file_name': regex}
+            filter_doc = {
+                "$or": [
+                    {"file_name": {"$regex": q, "$options": "i"}},
+                    {"caption": {"$regex": q, "$options": "i"}}
+                ]
+            }
 
     if file_type:
-        filter_doc['file_type'] = file_type
+        filter_doc["file_type"] = file_type
 
-    # Projection to only needed fields (faster)
-    projection = {"file_name": 1, "file_size": 1, "file_type": 1, "caption": 1, "_id": 1}
+    projection = {
+        "file_name": 1,
+        "file_size": 1,
+        "file_type": 1,
+        "caption": 1,
+        "_id": 1,
+    }
 
-    cursor = database[COLLECTION_NAME].find(filter_doc, projection)
+    try:
+        cursor = (
+            database[COLLECTION_NAME]
+            .find(filter_doc, projection)
+            .sort("$natural", -1)
+            .skip(offset)
+            .limit(max_results)
+            .max_time_ms(4000)  # batasi 4 detik agar tidak timeout lama
+        )
 
-    # Sort by natural order (recent first)
-    cursor = cursor.sort('$natural', -1).skip(offset).limit(max_results)
+        docs = await cursor.to_list(length=max_results)
+    except Exception as e:
+        logger.warning(f"Fallback search triggered due to slow query: {e}")
+        docs = []
+        # Fallback pencarian manual ringan kalau query timeout
+        all_docs = await database[COLLECTION_NAME].find({}, projection).sort("$natural", -1).to_list(length=200)
+        query_lower = query.lower()
+        for d in all_docs:
+            if query_lower in d.get("file_name", "").lower():
+                docs.append(d)
+                if len(docs) >= max_results:
+                    break
 
-    # Convert cursor to list (motor)
-    files = await cursor.to_list(length=max_results)
-
-    # Normalize returned documents to have expected attributes (compatibility)
     normalized = []
-    for d in files:
-        # If stored with _id as file_id then adjust
+    for d in docs:
         file_doc = {
             "file_id": str(d.get("_id")) if "_id" in d else d.get("file_id"),
             "file_name": d.get("file_name"),
@@ -103,10 +124,7 @@ async def get_search_results(query, file_type=None, max_results=10, offset=0, re
         }
         normalized.append(file_doc)
 
-    # Determine next_offset: if returned less than requested max -> no more results
-    if len(normalized) < max_results:
-        next_offset = ''
-    else:
-        next_offset = offset + max_results
+    # Tentukan next_offset
+    next_offset = "" if len(normalized) < max_results else offset + max_results
 
     return normalized, next_offset
