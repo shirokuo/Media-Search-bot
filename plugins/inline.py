@@ -18,78 +18,88 @@ cache_time = 0 if AUTH_USERS or AUTH_CHANNEL else CACHE_TIME
 @Client.on_inline_query(filters.user(AUTH_USERS) if AUTH_USERS else None)
 async def answer(bot, query):
     try:
-        raw = query.query or ""
-        text = raw.strip()
-        is_empty_query = (text == "")
-
-        file_type = None
-        if not is_empty_query and '|' in text:
-            text, file_type = text.split('|', maxsplit=1)
-            text = text.strip()
-            file_type = file_type.strip().lower()
-
+        text = (query.query or "").strip()
         offset = int(query.offset or 0)
-        reply_markup = get_reply_markup(bot.username, query=text)
-        max_results = 10
+        is_empty = text == ""
 
-        # Use slightly less than 5s to be safe
         try:
             files, next_offset = await asyncio.wait_for(
-                get_search_results(text, file_type=file_type, max_results=max_results, offset=offset, recent=is_empty_query),
-                timeout=4.9
+                get_search_results(text, max_results=10, offset=offset, recent=is_empty),
+                timeout=4.5
             )
         except asyncio.TimeoutError:
             logger.warning(f"Search timeout for query: {text}")
             await query.answer(
-                results=[],
+                results=[
+                    InlineQueryResultArticle(
+                        title="⚠️ Pencarian terlalu lama",
+                        input_message_content=InputTextMessageContent(
+                            "⏳ Pencarian melebihi batas waktu. Coba gunakan kata kunci yang lebih spesifik."
+                        ),
+                        description="Coba perpendek atau perjelas kata kunci kamu.",
+                    )
+                ],
                 cache_time=0,
-                switch_pm_text="⚠️ Pencarian terlalu lama, coba kata kunci yang lebih spesifik",
-                switch_pm_parameter="retry"
+                switch_pm_text="⚠️ Timeout",
+                switch_pm_parameter="timeout"
             )
             return
 
         results = []
-        for file in files:
-            file_id = file.get("file_id") if isinstance(file, dict) else getattr(file, "file_id", None)
-            file_name = file.get("file_name") if isinstance(file, dict) else getattr(file, "file_name", None)
-            if not file_id or not file_name:
-                continue
-            file_size = file.get("file_size") if isinstance(file, dict) else getattr(file, "file_size", None)
-            file_type_val = file.get("file_type") if isinstance(file, dict) else getattr(file, "file_type", None)
-            caption = file.get("caption") if isinstance(file, dict) else getattr(file, "caption", None)
+        if files:
+            for f in files:
+                file_id = f.get("file_id")
+                file_name = f.get("file_name") or "Tanpa Nama"
+                file_size = f.get("file_size") or 0
+                file_type = f.get("file_type") or "Unknown"
+                caption = f.get("caption") or ""
 
+                results.append(
+                    InlineQueryResultCachedDocument(
+                        title=file_name,
+                        document_file_id=file_id,
+                        caption=caption,
+                        description=f"📦 {file_type.upper()} | 💾 {round(file_size/1024/1024, 2)} MB",
+                        reply_markup=InlineKeyboardMarkup(
+                            [
+                                [InlineKeyboardButton(SHARE_BUTTON_TEXT, switch_inline_query=file_name)]
+                            ]
+                        )
+                    )
+                )
+
+        # Jika tidak ada hasil sama sekali, tampilkan not found message langsung di inline result
+        if not results:
             results.append(
-                InlineQueryResultCachedDocument(
-                    title=file_name,
-                    document_file_id=file_id,
-                    caption=caption or "",
-                    description=f"Size: {size_formatter(file_size)} | Type: {file_type_val or 'N/A'}",
-                    reply_markup=reply_markup
+                InlineQueryResultArticle(
+                    title=f"{emoji.CROSS_MARK} Tidak ditemukan hasil",
+                    input_message_content=InputTextMessageContent(
+                        f"❌ Tidak ditemukan file yang cocok untuk: **{text or 'Kueri kosong'}**"
+                    ),
+                    description="Coba kata kunci lain atau periksa ejaan file.",
                 )
             )
 
-        if results:
-            switch_pm_text = f"{emoji.FILE_FOLDER} Hasil"
-            if text:
-                switch_pm_text += f" untuk '{text}'"
-            await query.answer(
-                results=results,
-                cache_time=cache_time,
-                switch_pm_text=switch_pm_text,
-                switch_pm_parameter="start",
-                next_offset=str(next_offset) if next_offset != '' else ''
-            )
-        else:
-            if is_empty_query:
-                switch_pm_text = f"{emoji.CROSS_MARK} Tidak ada file terbaru"
-            else:
-                switch_pm_text = f"{emoji.CROSS_MARK} Tidak ditemukan hasil untuk '{text}'"
-            await query.answer(results=[], cache_time=cache_time, switch_pm_text=switch_pm_text, switch_pm_parameter="notfound")
+        await query.answer(
+            results=results,
+            cache_time=cache_time,
+            is_personal=True,
+            next_offset=str(next_offset) if next_offset else "",
+        )
 
     except Exception as e:
         logger.exception(f"❌ Inline query error: {e}")
         try:
-            await query.answer(results=[], cache_time=0, switch_pm_text="⚠️ Terjadi kesalahan", switch_pm_parameter="error")
+            await query.answer(
+                results=[
+                    InlineQueryResultArticle(
+                        title="❌ Terjadi kesalahan",
+                        input_message_content=InputTextMessageContent("⚠️ Kesalahan internal, coba lagi nanti."),
+                    )
+                ],
+                cache_time=0,
+                is_personal=True,
+            )
         except Exception:
             pass
 
