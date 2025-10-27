@@ -60,118 +60,76 @@ async def save_file(media):
 
 async def get_search_results(query, file_type=None, max_results=10, offset=0, recent=False):
     """
-    Tiered search to avoid collection-wide scanning that causes timeouts:
-    1) If recent=True or empty query -> return recent files.
-    2) Try $text search (fast if text index exists).
-    3) Try $regex with small max_time_ms.
-    4) Fallback: scan recent N docs and filter in Python (safe).
-    Returns (normalized_results_list, next_offset)
+    Akurat, cepat, dan aman dari timeout:
+    1. Jika query kosong -> tampilkan file terbaru.
+    2. Coba cari dengan regex case-insensitive di file_name dan caption.
+    3. Jika hasil kosong, kembalikan tanda 'not_found'.
     """
-    # Normalization
     q = (query or "").strip()
-    projection = {
-        "file_name": 1,
-        "file_size": 1,
-        "file_type": 1,
-        "caption": 1,
-        "_id": 1,
-    }
+    projection = {"file_name": 1, "file_size": 1, "file_type": 1, "caption": 1, "_id": 1}
 
-    # Helper to normalize docs to expected format
     def _normalize(docs):
         normalized = []
         for d in docs:
-            file_doc = {
-                "file_id": str(d.get("_id")) if "_id" in d else d.get("file_id"),
+            normalized.append({
+                "file_id": str(d.get("_id")),
                 "file_name": d.get("file_name"),
                 "file_size": d.get("file_size"),
                 "file_type": d.get("file_type"),
                 "caption": d.get("caption"),
-            }
-            normalized.append(file_doc)
+            })
         return normalized
 
-    # 1) recent / empty
+    # Jika tidak ada query => tampilkan file terbaru
     if recent or not q:
-        cursor = database[COLLECTION_NAME].find({}, projection).sort("$natural", -1).skip(offset).limit(max_results)
+        cursor = (
+            database[COLLECTION_NAME]
+            .find({}, projection)
+            .sort("$natural", -1)
+            .skip(offset)
+            .limit(max_results)
+        )
         docs = await cursor.to_list(length=max_results)
         normalized = _normalize(docs)
         next_offset = "" if len(normalized) < max_results else offset + max_results
         return normalized, next_offset
 
-    # 2) Try text search first (if text index exists) - fastest when available
-    try:
-        text_filter = {"$text": {"$search": q}}
-        # include score to sort
-        cursor = database[COLLECTION_NAME].find(text_filter, {**projection, "score": {"$meta": "textScore"}})
-        cursor = cursor.sort([("score", {"$meta": "textScore"})]).skip(offset).limit(max_results)
-        docs = await cursor.to_list(length=max_results)
-        if docs:
-            normalized = _normalize(docs)
-            next_offset = "" if len(normalized) < max_results else offset + max_results
-            logger.debug(f"Search: text-search success for '{q}', returned {len(normalized)}")
-            return normalized, next_offset
-    except Exception as e:
-        # Likely no text index or other error — ignore and continue to regex
-        logger.debug(f"Text search not available/failed for '{q}': {e}")
+    # Buat regex yang toleran (ignore case dan spasi, simbol)
+    # Regex memecah kata dan mencari kecocokan sebagian
+    safe_q = re.escape(q)
+    pattern = "|".join(
+        re.escape(word.strip()) for word in q.split() if word.strip()
+    )  # contoh: "how bot" => "how|bot"
+    regex = re.compile(pattern, re.IGNORECASE)
 
-    # 3) Try $regex with limited max_time_ms to avoid long blocking
-    try:
-        # simple substring regex (case-insensitive)
-        # NOTE: do NOT escape here completely to allow searching for dots etc.
-        # but sanitize by trimming whitespace
-        regex = q
-        if USE_CAPTION_FILTER:
-            filter_doc = {
-                "$or": [
-                    {"file_name": {"$regex": regex, "$options": "i"}},
-                    {"caption": {"$regex": regex, "$options": "i"}},
-                ]
-            }
-        else:
-            filter_doc = {"file_name": {"$regex": regex, "$options": "i"}}
+    if USE_CAPTION_FILTER:
+        filter_doc = {
+            "$or": [
+                {"file_name": {"$regex": regex}},
+                {"caption": {"$regex": regex}},
+            ]
+        }
+    else:
+        filter_doc = {"file_name": {"$regex": regex}}
 
+    try:
         cursor = (
             database[COLLECTION_NAME]
             .find(filter_doc, projection)
             .sort("$natural", -1)
             .skip(offset)
             .limit(max_results)
-            .max_time_ms(1500)  # cepat: batasi 1.5 detik
+            .max_time_ms(2000)  # hindari timeout
         )
         docs = await cursor.to_list(length=max_results)
         if docs:
             normalized = _normalize(docs)
             next_offset = "" if len(normalized) < max_results else offset + max_results
-            logger.debug(f"Search: regex success for '{q}', returned {len(normalized)}")
+            logger.info(f"✅ Search success for query '{q}', found {len(normalized)} results")
             return normalized, next_offset
+        else:
+            logger.info(f"⚠️ No match found for query '{q}'")
+            return [], ""
     except Exception as e:
-        logger.warning(f"Regex search slow/failed for '{q}': {e}")
-
-    # 4) Fallback: scan recent N docs and filter in Python
-    # If query is short (<=4) we limit to fewer docs; if longer allow more
-    recent_limit = 1000 if len(q) >= 5 else 600
-    try:
-        # Get recent docs only (avoid scanning whole collection)
-        recent_docs = await database[COLLECTION_NAME].find({}, projection).sort("$natural", -1).to_list(length=recent_limit)
-    except Exception as e:
-        logger.error(f"Fallback recent scan failed: {e}")
-        recent_docs = []
-
-    q_lower = q.lower()
-    matched = []
-    for d in recent_docs:
-        fname = (d.get("file_name") or "").lower()
-        caption = (d.get("caption") or "").lower()
-        if q_lower in fname or (USE_CAPTION_FILTER and q_lower in caption):
-            matched.append(d)
-            if len(matched) >= (offset + max_results):
-                break
-
-    # apply offset and slice
-    sliced = matched[offset: offset + max_results]
-    normalized = _normalize(sliced)
-    next_offset = "" if len(sliced) < max_results else offset + max_results
-    logger.debug(f"Search: fallback matched {len(normalized)} for '{q}' from recent {len(recent_docs)} docs")
-
-    return normalized, next_offset
+        logger.error(f"❌ Error during search '{q}': {e}")
+        return [], ""
