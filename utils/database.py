@@ -58,21 +58,29 @@ async def save_file(media):
             logger.info(media.file_name + " is saved in database")
 
 
-async def get_search_results(query, file_type=None, max_results=10, offset=0, recent=False):
+async def get_search_results(query: str, file_type=None, max_results=10, offset=0, recent=False):
     """
-    Akurat, cepat, dan aman dari timeout:
-    1. Jika query kosong -> tampilkan file terbaru.
-    2. Coba cari dengan regex case-insensitive di file_name dan caption.
-    3. Jika hasil kosong, kembalikan tanda 'not_found'.
+    Advanced search with:
+    - Smart regex that tolerates partial match, punctuation, and spacing
+    - Optional caption search
+    - Fallback fuzzy search in Python
+    - Returns (results, next_offset)
     """
+
     q = (query or "").strip()
-    projection = {"file_name": 1, "file_size": 1, "file_type": 1, "caption": 1, "_id": 1}
+    projection = {
+        "file_name": 1,
+        "file_size": 1,
+        "file_type": 1,
+        "caption": 1,
+        "file_id": 1,
+    }
 
     def _normalize(docs):
         normalized = []
         for d in docs:
             normalized.append({
-                "file_id": str(d.get("_id")),
+                "file_id": d.get("file_id") or str(d.get("_id")),
                 "file_name": d.get("file_name"),
                 "file_size": d.get("file_size"),
                 "file_type": d.get("file_type"),
@@ -80,56 +88,65 @@ async def get_search_results(query, file_type=None, max_results=10, offset=0, re
             })
         return normalized
 
-    # Jika tidak ada query => tampilkan file terbaru
+    # Jika query kosong atau recent=True, ambil file terbaru
     if recent or not q:
-        cursor = (
-            database[COLLECTION_NAME]
-            .find({}, projection)
-            .sort("$natural", -1)
-            .skip(offset)
-            .limit(max_results)
-        )
+        cursor = database[COLLECTION_NAME].find({}, projection).sort("$natural", -1).skip(offset).limit(max_results)
         docs = await cursor.to_list(length=max_results)
         normalized = _normalize(docs)
         next_offset = "" if len(normalized) < max_results else offset + max_results
         return normalized, next_offset
 
-    # Buat regex yang toleran (ignore case dan spasi, simbol)
-    # Regex memecah kata dan mencari kecocokan sebagian
-    safe_q = re.escape(q)
-    pattern = "|".join(
-        re.escape(word.strip()) for word in q.split() if word.strip()
-    )  # contoh: "how bot" => "how|bot"
-    regex = re.compile(pattern, re.IGNORECASE)
+    # 🔍 Regex super fleksibel
+    # Contoh input: "how bot" → hasilkan pola "how.*bot"
+    safe_query = re.sub(r"[^0-9a-zA-Z\u00C0-\u024F]+", " ", q).strip()
+    regex_pattern = ".*".join(map(re.escape, safe_query.split()))
+    smart_regex = re.compile(regex_pattern, re.IGNORECASE)
 
-    if USE_CAPTION_FILTER:
-        filter_doc = {
-            "$or": [
-                {"file_name": {"$regex": regex}},
-                {"caption": {"$regex": regex}},
-            ]
-        }
-    else:
-        filter_doc = {"file_name": {"$regex": regex}}
-
+    # 🔹 Tahap 1: Regex search di Mongo (dengan batas waktu aman)
     try:
+        mongo_filter = {
+            "$or": [{"file_name": {"$regex": smart_regex}}]
+        }
+        if USE_CAPTION_FILTER:
+            mongo_filter["$or"].append({"caption": {"$regex": smart_regex}})
+
         cursor = (
             database[COLLECTION_NAME]
-            .find(filter_doc, projection)
+            .find(mongo_filter, projection)
             .sort("$natural", -1)
             .skip(offset)
             .limit(max_results)
-            .max_time_ms(2000)  # hindari timeout
+            .max_time_ms(2500)
         )
         docs = await cursor.to_list(length=max_results)
         if docs:
             normalized = _normalize(docs)
             next_offset = "" if len(normalized) < max_results else offset + max_results
-            logger.info(f"✅ Search success for query '{q}', found {len(normalized)} results")
+            logger.info(f"Super regex matched {len(normalized)} result(s) for '{q}'")
             return normalized, next_offset
-        else:
-            logger.info(f"⚠️ No match found for query '{q}'")
-            return [], ""
     except Exception as e:
-        logger.error(f"❌ Error during search '{q}': {e}")
-        return [], ""
+        logger.warning(f"Regex search error for '{q}': {e}")
+
+    # 🔹 Tahap 2: fallback fuzzy search (scan sebagian data dan cocokan manual)
+    try:
+        recent_docs = await database[COLLECTION_NAME].find({}, projection).sort("$natural", -1).to_list(length=1000)
+        q_lower = q.lower()
+        matched = []
+        for d in recent_docs:
+            name = (d.get("file_name") or "").lower()
+            caption = (d.get("caption") or "").lower()
+            if q_lower in name or (USE_CAPTION_FILTER and q_lower in caption):
+                matched.append(d)
+                if len(matched) >= (offset + max_results):
+                    break
+        sliced = matched[offset: offset + max_results]
+        if sliced:
+            normalized = _normalize(sliced)
+            next_offset = "" if len(sliced) < max_results else offset + max_results
+            logger.info(f"Fallback fuzzy matched {len(normalized)} for '{q}'")
+            return normalized, next_offset
+    except Exception as e:
+        logger.error(f"Fuzzy fallback failed for '{q}': {e}")
+
+    # Jika tidak ada hasil sama sekali
+    return [], ""
