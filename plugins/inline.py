@@ -1,12 +1,13 @@
-#plugins/inline.py
+##plugins/inline.py
 
+import asyncio
 import logging
 from urllib.parse import quote
 
 from pyrogram import Client, emoji, filters
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultCachedDocument
-
+from utils import get_search_results
 from utils.database import get_search_results  # pastikan import langsung dari utils.database
 from info import CACHE_TIME, SHARE_BUTTON_TEXT, AUTH_USERS, AUTH_CHANNEL
 
