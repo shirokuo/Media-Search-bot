@@ -1,4 +1,4 @@
-plugins/inline.py
+#plugins/inline.py
 
 import logging
 from urllib.parse import quote
