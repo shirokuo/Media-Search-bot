@@ -58,30 +58,55 @@ async def save_file(media):
             logger.info(media.file_name + " is saved in database")
 
 
-async def get_search_results(query, file_type=None, max_results=10, offset=0):
-    """For given query return (results, next_offset)"""
-    query = query.strip()
-    if not query:
-        regex = re.compile(".*", re.IGNORECASE)
+async def get_search_results(query, file_type=None, max_results=10, offset=0, recent=False):
+    """
+    For given query return (results, next_offset)
+    recent=True -> return recent files (no regex)
+    """
+    # Build filter
+    if recent or not query:
+        filter_doc = {}
     else:
-        # Lebih fleksibel: cocokkan di mana pun dalam nama file
-        safe_query = re.escape(query)
-        regex = re.compile(f".*{safe_query}.*", re.IGNORECASE)
-
-    if USE_CAPTION_FILTER:
-        search_filter = {'$or': [{'file_name': regex}, {'caption': regex}]}
-    else:
-        search_filter = {'file_name': regex}
+        q = query.strip()
+        # Escape user input to prevent regex issues
+        escaped = re.escape(q)
+        regex = re.compile(f".*{escaped}.*", flags=re.IGNORECASE)
+        if USE_CAPTION_FILTER:
+            filter_doc = {'$or': [{'file_name': regex}, {'caption': regex}]}
+        else:
+            filter_doc = {'file_name': regex}
 
     if file_type:
-        search_filter['file_type'] = file_type
+        filter_doc['file_type'] = file_type
 
-    total = await Media.count_documents(search_filter)
-    next_offset = offset + max_results
-    if next_offset >= total:
-        next_offset = ''
+    # Projection to only needed fields (faster)
+    projection = {"file_name": 1, "file_size": 1, "file_type": 1, "caption": 1, "_id": 1}
 
-    cursor = Media.find(search_filter).sort('$natural', -1).skip(offset).limit(max_results)
+    cursor = database[COLLECTION_NAME].find(filter_doc, projection)
+
+    # Sort by natural order (recent first)
+    cursor = cursor.sort('$natural', -1).skip(offset).limit(max_results)
+
+    # Convert cursor to list (motor)
     files = await cursor.to_list(length=max_results)
 
-    return files, next_offset
+    # Normalize returned documents to have expected attributes (compatibility)
+    normalized = []
+    for d in files:
+        # If stored with _id as file_id then adjust
+        file_doc = {
+            "file_id": str(d.get("_id")) if "_id" in d else d.get("file_id"),
+            "file_name": d.get("file_name"),
+            "file_size": d.get("file_size"),
+            "file_type": d.get("file_type"),
+            "caption": d.get("caption"),
+        }
+        normalized.append(file_doc)
+
+    # Determine next_offset: if returned less than requested max -> no more results
+    if len(normalized) < max_results:
+        next_offset = ''
+    else:
+        next_offset = offset + max_results
+
+    return normalized, next_offset
