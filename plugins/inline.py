@@ -1,13 +1,13 @@
 ##plugins/inline.py
 
-import asyncio
 import logging
+import asyncio
 from urllib.parse import quote
 
 from pyrogram import Client, emoji, filters
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultCachedDocument
-from utils import get_search_results
+
 from utils.database import get_search_results  # pastikan import langsung dari utils.database
 from info import CACHE_TIME, SHARE_BUTTON_TEXT, AUTH_USERS, AUTH_CHANNEL
 
@@ -19,84 +19,109 @@ cache_time = 0 if AUTH_USERS or AUTH_CHANNEL else CACHE_TIME
 async def answer(bot, query):
     """Handle inline search query"""
     try:
-        text = query.query.strip()
-        if not text:
-            await query.answer(
-                results=[],
-                cache_time=0,
-                switch_pm_text="🔍 Ketik nama file untuk mencari",
-                switch_pm_parameter="help"
-            )
-            return
+        raw = query.query or ""  # jangan None
+        text = raw.strip()
 
-        # Support "|filetype"
-        if '|' in text:
+        # Jika bot dipanggil tanpa kata kunci (user mengetik hanya @bot), tampilkan recent
+        is_empty_query = (text == "")
+
+        # support "text | filetype"
+        file_type = None
+        if not is_empty_query and '|' in text:
             text, file_type = text.split('|', maxsplit=1)
-            text, file_type = text.strip(), file_type.strip().lower()
-        else:
-            file_type = None
+            text = text.strip()
+            file_type = file_type.strip().lower()
 
-        # Fetch results (limit 10)
         offset = int(query.offset or 0)
         reply_markup = get_reply_markup(bot.username, query=text)
 
-        # Timeout untuk mencegah QUERY_ID_INVALID
-        try:
-            files, next_offset = await asyncio.wait_for(
-                get_search_results(text, file_type=file_type, max_results=10, offset=offset),
-                timeout=4.5
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"Search timeout for query: {text}")
-            await query.answer(
-                results=[],
-                cache_time=0,
-                switch_pm_text="⚠️ Pencarian terlalu lama, coba lagi",
-                switch_pm_parameter="retry"
-            )
-            return
+        # ketika kosong, request recent (fast) - berikan lebih banyak hasil agar user bisa scroll
+        max_results = 10
+        if is_empty_query:
+            # recent results: offset digunakan sama
+            try:
+                files, next_offset = await asyncio.wait_for(
+                    get_search_results("", file_type=file_type, max_results=max_results, offset=offset, recent=True),
+                    timeout=4.8
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Search timeout for recent results")
+                await query.answer(results=[], cache_time=0,
+                                   switch_pm_text="⚠️ Pencarian terlalu lama, coba lagi",
+                                   switch_pm_parameter="retry")
+                return
+        else:
+            # normal search dengan timeout; jika timeout -> beri pesan friendly
+            try:
+                files, next_offset = await asyncio.wait_for(
+                    get_search_results(text, file_type=file_type, max_results=max_results, offset=offset, recent=False),
+                    timeout=4.8
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Search timeout for query: {text}")
+                await query.answer(
+                    results=[],
+                    cache_time=0,
+                    switch_pm_text="⚠️ Pencarian terlalu lama, coba singkat kata kunci atau coba lagi",
+                    switch_pm_parameter="retry"
+                )
+                return
 
         results = []
         for file in files:
-            # pastikan file punya file_id dan nama
-            if not getattr(file, "file_id", None) or not getattr(file, "file_name", None):
+            # validasi minimal
+            file_id = getattr(file, "file_id", None) or getattr(file, "file_id", None) or file.get("file_id") if isinstance(file, dict) else None
+            file_name = getattr(file, "file_name", None) or file.get("file_name") if isinstance(file, dict) else None
+            if not file_id or not file_name:
                 continue
+
+            # make sure file_size/file_type/caption retrieval robust
+            file_size = getattr(file, "file_size", None) or file.get("file_size") if isinstance(file, dict) else None
+            file_type_val = getattr(file, "file_type", None) or file.get("file_type") if isinstance(file, dict) else None
+            caption = getattr(file, "caption", None) or file.get("caption") if isinstance(file, dict) else None
+
             results.append(
                 InlineQueryResultCachedDocument(
-                    title=file.file_name,
-                    document_file_id=file.file_id,
-                    caption=file.caption or "",
-                    description=f"Size: {size_formatter(file.file_size)} | Type: {file.file_type or 'N/A'}",
+                    title=file_name,
+                    document_file_id=file_id,
+                    caption=caption or "",
+                    description=f"Size: {size_formatter(file_size)} | Type: {file_type_val or 'N/A'}",
                     reply_markup=reply_markup
                 )
             )
 
         if results:
-            switch_pm_text = f"{emoji.FILE_FOLDER} Hasil untuk '{text}'"
+            switch_pm_text = f"{emoji.FILE_FOLDER} Hasil"
+            if text:
+                switch_pm_text += f" untuk '{text}'"
             await query.answer(
                 results=results,
                 cache_time=cache_time,
                 switch_pm_text=switch_pm_text,
                 switch_pm_parameter="start",
-                next_offset=str(next_offset)
+                next_offset=str(next_offset) if next_offset != '' else ''
             )
         else:
+            # ketika kosong dan ini query kosong sebelumnya, tunjukkan pesan default
+            if is_empty_query:
+                switch_pm_text = f"{emoji.CROSS_MARK} Tidak ada file terbaru"
+            else:
+                switch_pm_text = f"{emoji.CROSS_MARK} Tidak ditemukan hasil untuk '{text}'"
+
             await query.answer(
                 results=[],
                 cache_time=cache_time,
-                switch_pm_text=f"{emoji.CROSS_MARK} Tidak ditemukan hasil untuk '{text}'",
+                switch_pm_text=switch_pm_text,
                 switch_pm_parameter="notfound"
             )
     except Exception as e:
         logger.exception(f"❌ Inline query error: {e}")
+        # jangan crash; usahakan jawab ke Telegram
         try:
-            await query.answer(
-                results=[],
-                cache_time=0,
-                switch_pm_text="⚠️ Terjadi kesalahan",
-                switch_pm_parameter="error"
-            )
-        except:
+            await query.answer(results=[], cache_time=0,
+                               switch_pm_text="⚠️ Terjadi kesalahan internal",
+                               switch_pm_parameter="error")
+        except Exception:
             pass
 
 
